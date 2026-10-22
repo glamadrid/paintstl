@@ -1,0 +1,15 @@
+# Artefactos de pruebas temporales (ver /memories/repo/paintstl-project.md)
+.tmp-*
+.playwright-tmp-locked.png
+
+# Modelo original pesado (48MB): no committear nunca al repo (infla el
+# historial de git para siempre). Vive solo en local; si se quiere conservar
+# públicamente, subir como asset de un GitHub Release en vez de al repo.
+models/spiderman-bust.stl
+
+# Dependencias (este proyecto no las necesita hoy, pero por si acaso)
+node_modules/
+
+# Basura de sistema operativo
+Thumbs.db
+.DS_Store

@@ -1,0 +1,12 @@
+{
+  "name": "paintstl",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Escultura de archivos STL en VR (Oculus Quest 2) con Three.js y WebXR",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "generate-default-stl": "node scripts/generate-default-stl.js"
+  },
+  "license": "MIT"
+}
