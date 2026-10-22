@@ -138,6 +138,13 @@ let myPeerId = null;
 let lastPresenceSendTime = 0;
 const peerAvatars = new Map(); // peerId -> { group, head, left, right, target*, has* }
 
+// Multijugador (Fase 3): piezas compartidas con colocación decidida por el
+// servidor (ver server/realtime-server.js) - evita que cada cliente calcule
+// su propia posición para una pieza nueva y queden en lugares distintos.
+const networkPieceMeshes = new Map(); // pieceId -> mesh ya colocado en la escena
+const pendingPieceUploads = new Map(); // requestId -> función que resuelve la promesa de esa subida
+const PIECE_UPLOAD_TIMEOUT_MS = 15000; // si el servidor no responde en este tiempo, no se queda colgado para siempre
+
 init();
 
 function init() {
@@ -295,13 +302,29 @@ function loadDefaultModel() {
   const loader = new STLLoader();
   loader.load(
     DEFAULT_MODEL_URL,
-    (geometry) => addMesh(buildPieceMesh(geometry, 'Spiderman Bust')),
+    // Slot FIJO (0), no meshes.length: si hay multijugador conectado, la
+    // lista de piezas de red (JSON chico) suele llegar ANTES de que termine
+    // de bajarse+parsearse este STL (varios MB) - con meshes.length el slot
+    // de este modelo dependería de esa carrera y podría coincidir con el de
+    // una pieza de red ya colocada (confirmado empíricamente probando Fase 3).
+    (geometry) => addMesh(buildPieceMesh(geometry, 'Spiderman Bust', 0)),
     undefined,
     (error) => console.error('No se pudo cargar el STL por defecto:', error)
   );
 }
 
+// Si hay conexión multijugador activa, la pieza se sube al servidor (que
+// decide su posición y la reparte a todos, incluido quien la subió). Si no
+// hay servidor disponible, se mantiene el comportamiento original 100% local
+// - el modo un-jugador nunca debe depender de que el multijugador funcione.
 function loadSTLFromFile(file) {
+  if (multiplayerSocket && multiplayerSocket.readyState === WebSocket.OPEN) {
+    return uploadPieceToServer(file);
+  }
+  return loadSTLFromFileLocal(file);
+}
+
+function loadSTLFromFileLocal(file) {
   return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -351,7 +374,19 @@ async function loadSTLFilesFromList(fileList) {
   }
 }
 
-function buildPieceMesh(rawGeometry, pieceName) {
+// Desplazamiento de una pieza según su "slot" (número de orden), en una
+// cuadrícula de 3 columnas - compartido entre la colocación local (basada en
+// meshes.length) y la colocación de red (basada en el slot que asigna el
+// servidor), para que ambas usen exactamente la misma fórmula.
+function pieceSlotOffset(slot) {
+  return new THREE.Vector3(
+    ((slot % 3) - 1) * PIECE_SPREAD,
+    0,
+    Math.floor(slot / 3) * PIECE_SPREAD
+  );
+}
+
+function buildPieceMesh(rawGeometry, pieceName, slot) {
   // Centra el modelo en su propio origen y lo escala a un tamaño cómodo para VR,
   // sin importar en qué unidades (mm, cm, in) haya sido exportado el STL.
   rawGeometry.center();
@@ -402,12 +437,12 @@ function buildPieceMesh(rawGeometry, pieceName) {
 
   // Cada pieza nueva se desplaza un poco para no quedar apilada exactamente
   // sobre la anterior (útil cuando un modelo viene repartido en varias piezas).
-  const slot = meshes.length;
-  mesh.position.copy(MODEL_POSITION).add(new THREE.Vector3(
-    ((slot % 3) - 1) * PIECE_SPREAD,
-    0,
-    Math.floor(slot / 3) * PIECE_SPREAD
-  ));
+  // En piezas de red, addNetworkPiece sobrescribe esta posición con el slot
+  // autoritativo que asignó el servidor - este valor es solo el de partida
+  // para piezas puramente locales (sin multijugador). 'slot' explícito (ej.
+  // el modelo por defecto, siempre 0) evita depender de meshes.length cuando
+  // ese conteo puede variar por una carrera con piezas de red entrantes.
+  mesh.position.copy(MODEL_POSITION).add(pieceSlotOffset(slot !== undefined ? slot : meshes.length));
   mesh.castShadow = true;
   mesh.receiveShadow = true;
 
@@ -1789,7 +1824,97 @@ function handleMultiplayerMessage(message) {
     updatePeerPresence(message.from, message.payload);
   } else if (message.type === 'peer-left') {
     removePeerAvatar(message.id);
+  } else if (message.type === 'piece-added') {
+    addNetworkPiece(message);
+    const finish = pendingPieceUploads.get(message.requestId);
+    if (finish) finish(true);
+  } else if (message.type === 'piece-list') {
+    for (const piece of message.pieces) addNetworkPiece(piece);
   }
+}
+
+// Sube un archivo STL al servidor en vez de colocarlo localmente - la pieza
+// solo aparece en pantalla cuando llega la respuesta 'piece-added' (ver
+// handleMultiplayerMessage), igual para quien la subió que para los demás,
+// así todos quedan de acuerdo en dónde está. Con tiempo límite: si el
+// servidor no responde, no deja la carga de archivos colgada para siempre.
+function uploadPieceToServer(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const requestId = crypto.randomUUID();
+      let settled = false;
+      const timeoutId = setTimeout(() => {
+        console.warn('Subida de "' + file.name + '" al servidor multijugador agotó el tiempo de espera.');
+        finish(false);
+      }, PIECE_UPLOAD_TIMEOUT_MS);
+
+      function finish(result) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        pendingPieceUploads.delete(requestId);
+        resolve(result);
+      }
+
+      pendingPieceUploads.set(requestId, finish);
+      try {
+        multiplayerSocket.send(JSON.stringify({
+          type: 'add-piece',
+          requestId,
+          name: file.name.replace(/\.stl$/i, ''),
+          fileBase64: arrayBufferToBase64(reader.result),
+        }));
+      } catch (error) {
+        console.error('No se pudo enviar la pieza al servidor:', error.message);
+        finish(false);
+      }
+    };
+    reader.onerror = () => resolve(false);
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// Crea en la escena una pieza que llegó del servidor (recién agregada por
+// alguien, o parte del historial de la sala al conectarse) - la posición la
+// decide el slot que asignó el servidor, nunca un cálculo local.
+function addNetworkPiece(piece) {
+  if (networkPieceMeshes.has(piece.id)) return; // ya existe (ej. piece-list repetido tras reconectar)
+
+  let geometry;
+  try {
+    geometry = new STLLoader().parse(base64ToArrayBuffer(piece.fileBase64));
+  } catch (error) {
+    console.error('No se pudo leer la pieza recibida de la red:', piece.name, error);
+    return;
+  }
+
+  const mesh = buildPieceMesh(geometry, piece.name);
+  mesh.position.copy(MODEL_POSITION).add(pieceSlotOffset(piece.slot));
+  mesh.userData.networkId = piece.id;
+  networkPieceMeshes.set(piece.id, mesh);
+  addMesh(mesh);
+}
+
+// atob/btoa trabajan con strings, no con bytes crudos - y pasar un
+// Uint8Array grande entero a String.fromCharCode.apply revienta con
+// "Maximum call stack size exceeded" (cada byte es un argumento de la
+// llamada) - por eso se arma en trozos de 32KB.
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
 }
 
 // Manda la posición/orientación de cabeza (+ manos, si hay sesión XR activa)
