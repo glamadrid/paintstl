@@ -33,6 +33,16 @@ const RESIZE_STEP = 1.1; // factor de escalado de la pieza seleccionada por clic
 const MAX_UNDO = 30; // número máximo de acciones que se pueden deshacer
 const SMART_PAINT_DEFAULT_DEGREES = 20; // tolerancia inicial del "Pintado rápido" (ángulo entre caras vecinas)
 
+// ---------------------------------------------------------------------------
+// Multijugador (Fase 2: presencia compartida - ver server/realtime-server.js)
+// ---------------------------------------------------------------------------
+// TODO: cambiar cuando el servidor esté desplegado en un host real (todavía
+// solo corre localmente, Fase 1 del plan de implementación).
+const MULTIPLAYER_SERVER_URL = 'ws://localhost:8787';
+const MULTIPLAYER_ROOM = new URLSearchParams(location.search).get('room') || 'default';
+const PRESENCE_SEND_INTERVAL_MS = 100; // ~10 veces/seg - de sobra con interpolación en el receptor
+const PEER_AVATAR_LERP_SPEED = 12; // qué tan rápido el avatar visual "alcanza" el último dato recibido
+
 const COLOR_PALETTE = [
   '#3f88c5', '#e63946', '#2a9d8f', '#f4a261',
   '#ffffff', '#1b1b22', '#ffd60a', '#9d4edd',
@@ -121,6 +131,13 @@ const PALM_UP_DOT_THRESHOLD = 0.6; // coseno del ángulo máximo respecto a +Y (
 const PALM_GESTURE_HOLD_MS = 500;
 const palmGesture = { holdStartTime: 0, armed: true };
 
+// Multijugador (Fase 2): conexión al servidor de tiempo real + avatares de
+// los demás usuarios conectados a la misma sala.
+let multiplayerSocket = null;
+let myPeerId = null;
+let lastPresenceSendTime = 0;
+const peerAvatars = new Map(); // peerId -> { group, head, left, right, target*, has* }
+
 init();
 
 function init() {
@@ -199,6 +216,7 @@ function init() {
   setupDesktopInteraction();
   setupKeyboardShortcuts();
   setupToolbar();
+  setupMultiplayer();
 
   window.addEventListener('resize', onWindowResize);
 }
@@ -1036,6 +1054,8 @@ function render(time) {
   }
   updateBrushIndicator();
   if (selectionHelper) selectionHelper.update();
+  sendPresence(time);
+  updatePeerAvatars(deltaSeconds);
 
   renderer.render(scene, camera);
 }
@@ -1715,6 +1735,177 @@ function updateVRMenuHighlight() {
     }
   }
   applyMenuButtonScales(); // sin esto el resaltado de "activo" no se vería hasta el próximo hover
+}
+
+// ---------------------------------------------------------------------------
+// Multijugador (Fase 2): presencia compartida (cabeza + manos de cada
+// usuario conectado a la misma sala). El servidor (server/realtime-server.js)
+// solo retransmite - toda la interpretación pasa aquí.
+// ---------------------------------------------------------------------------
+function setupMultiplayer() {
+  connectMultiplayerSocket();
+}
+
+function connectMultiplayerSocket() {
+  const url = MULTIPLAYER_SERVER_URL + '?room=' + encodeURIComponent(MULTIPLAYER_ROOM);
+  let socket;
+  try {
+    socket = new WebSocket(url);
+  } catch (error) {
+    console.warn('Multijugador no disponible (no se pudo crear el WebSocket):', error.message);
+    return;
+  }
+
+  socket.addEventListener('open', () => {
+    console.log('Multijugador: conectado a la sala "' + MULTIPLAYER_ROOM + '"');
+  });
+
+  socket.addEventListener('message', (event) => {
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    handleMultiplayerMessage(message);
+  });
+
+  // El multijugador es un añadido, no debe bloquear nada si el servidor no
+  // está corriendo (ej. todavía no desplegado - ver Fase 1 del plan):
+  // reintento simple e indefinido cada 2s, sin afectar el resto de la app.
+  socket.addEventListener('close', () => {
+    multiplayerSocket = null;
+    setTimeout(connectMultiplayerSocket, 2000);
+  });
+  socket.addEventListener('error', () => {}); // 'close' se dispara igual después; ahí se reintenta
+
+  multiplayerSocket = socket;
+}
+
+function handleMultiplayerMessage(message) {
+  if (message.type === 'welcome') {
+    myPeerId = message.id;
+  } else if (message.type === 'relay' && message.payload?.type === 'presence') {
+    updatePeerPresence(message.from, message.payload);
+  } else if (message.type === 'peer-left') {
+    removePeerAvatar(message.id);
+  }
+}
+
+// Manda la posición/orientación de cabeza (+ manos, si hay sesión XR activa)
+// a los demás. Llamado cada frame desde render(), pero se autolimita a
+// PRESENCE_SEND_INTERVAL_MS - no hace falta más frecuencia para que se vea
+// fluido del otro lado gracias a la interpolación en updatePeerAvatars().
+function sendPresence(time) {
+  if (!multiplayerSocket || multiplayerSocket.readyState !== WebSocket.OPEN) return;
+  if (time - lastPresenceSendTime < PRESENCE_SEND_INTERVAL_MS) return;
+  lastPresenceSendTime = time;
+
+  const presence = {
+    type: 'presence',
+    head: { position: camera.position.toArray(), quaternion: camera.quaternion.toArray() },
+    left: null,
+    right: null,
+  };
+
+  if (renderer.xr.isPresenting) {
+    const leftController = controllers.find((c) => c.userData.handedness === 'left');
+    const rightController = controllers.find((c) => c.userData.handedness === 'right');
+    if (leftController) presence.left = controllerPose(leftController);
+    if (rightController) presence.right = controllerPose(rightController);
+  }
+
+  multiplayerSocket.send(JSON.stringify(presence));
+}
+
+function controllerPose(controller) {
+  _controllerPos.setFromMatrixPosition(controller.matrixWorld);
+  return { position: _controllerPos.toArray(), quaternion: controller.quaternion.toArray() };
+}
+
+function updatePeerPresence(peerId, presence) {
+  let avatar = peerAvatars.get(peerId);
+  if (!avatar) {
+    avatar = createPeerAvatar();
+    peerAvatars.set(peerId, avatar);
+  }
+
+  avatar.targetHead.position.fromArray(presence.head.position);
+  avatar.targetHead.quaternion.fromArray(presence.head.quaternion);
+
+  avatar.hasLeft = !!presence.left;
+  if (presence.left) {
+    avatar.targetLeft.position.fromArray(presence.left.position);
+    avatar.targetLeft.quaternion.fromArray(presence.left.quaternion);
+  }
+  avatar.left.visible = avatar.hasLeft;
+
+  avatar.hasRight = !!presence.right;
+  if (presence.right) {
+    avatar.targetRight.position.fromArray(presence.right.position);
+    avatar.targetRight.quaternion.fromArray(presence.right.quaternion);
+  }
+  avatar.right.visible = avatar.hasRight;
+}
+
+// Representación mínima de otro usuario: una esfera para la cabeza y dos más
+// chicas para las manos (ocultas hasta que ese usuario entre en VR y reporte
+// datos de control/mano). Material propio por avatar (no compartido entre
+// usuarios) para poder liberarlo de forma segura en removePeerAvatar sin
+// afectar los avatares de los demás.
+function createPeerAvatar() {
+  const material = new THREE.MeshBasicMaterial({ color: 0x7fd1ff, transparent: true, opacity: 0.75 });
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.09, 16, 12), material);
+  const left = new THREE.Mesh(new THREE.SphereGeometry(0.035, 12, 8), material);
+  const right = new THREE.Mesh(new THREE.SphereGeometry(0.035, 12, 8), material);
+  left.visible = false;
+  right.visible = false;
+
+  const group = new THREE.Group();
+  group.add(head, left, right);
+  scene.add(group);
+
+  return {
+    group,
+    head,
+    left,
+    right,
+    targetHead: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion() },
+    targetLeft: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion() },
+    targetRight: { position: new THREE.Vector3(), quaternion: new THREE.Quaternion() },
+    hasLeft: false,
+    hasRight: false,
+  };
+}
+
+function removePeerAvatar(peerId) {
+  const avatar = peerAvatars.get(peerId);
+  if (!avatar) return;
+  scene.remove(avatar.group);
+  avatar.head.geometry.dispose();
+  avatar.left.geometry.dispose();
+  avatar.right.geometry.dispose();
+  avatar.head.material.dispose(); // compartido por los 3 meshes de ESTE avatar, basta una vez
+  peerAvatars.delete(peerId);
+}
+
+// Suaviza cada avatar hacia el último dato recibido (en vez de "saltar" a la
+// nueva posición) para disimular el jitter de red - llamado cada frame.
+function updatePeerAvatars(deltaSeconds) {
+  if (peerAvatars.size === 0) return;
+  const lerpFactor = Math.min(1, PEER_AVATAR_LERP_SPEED * deltaSeconds);
+  for (const avatar of peerAvatars.values()) {
+    avatar.head.position.lerp(avatar.targetHead.position, lerpFactor);
+    avatar.head.quaternion.slerp(avatar.targetHead.quaternion, lerpFactor);
+    if (avatar.hasLeft) {
+      avatar.left.position.lerp(avatar.targetLeft.position, lerpFactor);
+      avatar.left.quaternion.slerp(avatar.targetLeft.quaternion, lerpFactor);
+    }
+    if (avatar.hasRight) {
+      avatar.right.position.lerp(avatar.targetRight.position, lerpFactor);
+      avatar.right.quaternion.slerp(avatar.targetRight.quaternion, lerpFactor);
+    }
+  }
 }
 
 

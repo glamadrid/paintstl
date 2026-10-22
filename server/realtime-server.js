@@ -1,11 +1,12 @@
 // Servidor de tiempo real (WebSocket) para sesiones multijugador de PaintSTL.
-// Fase 1 del plan: solo transporte por "sala" (room) - retransmite mensajes
-// crudos entre quienes están en la misma sala, sin interpretar su contenido.
-// La lógica de qué significa cada mensaje (presencia, piezas, transforms,
-// pinceladas) se agrega en fases posteriores sobre esta misma base.
+// Fase 1: transporte por "sala" (room). Fase 2 añadió identidad por conexión
+// (necesaria para presencia: cada cliente debe saber de QUIÉN es cada
+// actualización que recibe) - el contenido del mensaje en sí sigue sin
+// interpretarse aquí, solo se envuelve con quién lo mandó.
 'use strict';
 
 const { WebSocketServer } = require('ws');
+const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT) || 8787;
 
@@ -27,23 +28,35 @@ wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
   const roomId = url.searchParams.get('room') || 'default';
   const room = getRoom(roomId);
-  room.add(ws);
+  ws.id = crypto.randomUUID();
   ws.roomId = roomId;
+  room.add(ws);
 
-  console.log(`+ Cliente conectado a la sala "${roomId}" (${room.size} en la sala)`);
+  ws.send(JSON.stringify({ type: 'welcome', id: ws.id }));
+  console.log(`+ ${ws.id} se unió a la sala "${roomId}" (${room.size} en la sala)`);
 
   ws.on('message', (data) => {
-    // Relay puro: reenvía el mensaje tal cual a los demás de la misma sala.
+    let payload;
+    try {
+      payload = JSON.parse(data.toString());
+    } catch {
+      return; // mensaje no es JSON válido, se ignora
+    }
+    const envelope = JSON.stringify({ type: 'relay', from: ws.id, payload });
     for (const peer of room) {
       if (peer !== ws && peer.readyState === peer.OPEN) {
-        peer.send(data);
+        peer.send(envelope);
       }
     }
   });
 
   ws.on('close', () => {
     room.delete(ws);
-    console.log(`- Cliente salió de la sala "${roomId}" (${room.size} restantes)`);
+    console.log(`- ${ws.id} salió de la sala "${roomId}" (${room.size} restantes)`);
+    const leftMessage = JSON.stringify({ type: 'peer-left', id: ws.id });
+    for (const peer of room) {
+      if (peer.readyState === peer.OPEN) peer.send(leftMessage);
+    }
     if (room.size === 0) rooms.delete(roomId);
   });
 
