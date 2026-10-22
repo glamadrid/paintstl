@@ -2,8 +2,11 @@
 // Fase 1: transporte por "sala" (room). Fase 2: identidad por conexión (para
 // presencia). Fase 3: el servidor pasa a ser DUEÑO de la lista de piezas de
 // cada sala - decide la posición (slot) de cada pieza nueva y la guarda en
-// memoria para poder mandarla completa a quien se una después. Todo lo demás
-// (ej. 'presence') sigue siendo un relay puro, sin interpretar.
+// memoria para poder mandarla completa a quien se una después. Fase 4: el
+// servidor también recuerda la última posición/rotación/escala conocida de
+// cada pieza (para que un recén llegado la vea donde quedó, no en su slot
+// original) y quién la tiene bloqueada mientras la está editando. Todo lo
+// demás (ej. 'presence') sigue siendo un relay puro, sin interpretar.
 'use strict';
 
 const { WebSocketServer } = require('ws');
@@ -70,12 +73,45 @@ wss.on('connection', (ws, req) => {
         name: message.name,
         fileBase64: message.fileBase64,
         slot: room.nextSlot++,
+        // null = aún no se movió, usar la posición por defecto del slot.
+        position: null,
+        quaternion: null,
+        scale: null,
+        lockedBy: null,
       };
       room.pieces.set(piece.id, piece);
       // Se manda a TODOS, incluido quien la subió - nadie coloca la pieza
       // por su cuenta, todos esperan la respuesta autoritativa del servidor.
       broadcastToRoom(room, { type: 'piece-added', requestId: message.requestId, ...piece }, null);
       console.log(`  + pieza "${piece.name}" agregada a la sala "${roomId}" (slot ${piece.slot})`);
+      return;
+    }
+
+    if (message.type === 'lock-piece') {
+      const piece = room.pieces.get(message.pieceId);
+      if (!piece || piece.lockedBy) return; // no existe, o ya la tiene alguien
+      piece.lockedBy = ws.id;
+      broadcastToRoom(room, { type: 'piece-locked', pieceId: piece.id, by: ws.id }, null);
+      return;
+    }
+
+    if (message.type === 'unlock-piece') {
+      const piece = room.pieces.get(message.pieceId);
+      if (!piece || piece.lockedBy !== ws.id) return; // solo quien la bloqueó puede soltarla
+      piece.lockedBy = null;
+      broadcastToRoom(room, { type: 'piece-unlocked', pieceId: piece.id }, null);
+      return;
+    }
+
+    if (message.type === 'transform') {
+      const piece = room.pieces.get(message.pieceId);
+      if (!piece) return;
+      piece.position = message.position;
+      piece.quaternion = message.quaternion;
+      piece.scale = message.scale;
+      // No hace falta mandarle esto a quien lo movió - ya lo tenía aplicado
+      // localmente desde que empezó a arrastrar.
+      broadcastToRoom(room, { type: 'piece-transform', pieceId: piece.id, position: piece.position, quaternion: piece.quaternion, scale: piece.scale }, ws);
       return;
     }
 
@@ -86,6 +122,15 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     room.connections.delete(ws);
+    // Si esta conexión se cae mientras tenía una pieza bloqueada (ej. a mitad
+    // de un arrastre), hay que soltarla - si no, quedaría bloqueada para
+    // siempre para los demás.
+    for (const piece of room.pieces.values()) {
+      if (piece.lockedBy === ws.id) {
+        piece.lockedBy = null;
+        broadcastToRoom(room, { type: 'piece-unlocked', pieceId: piece.id }, null);
+      }
+    }
     console.log(`- ${ws.id} salió de la sala "${roomId}" (${room.connections.size} restantes)`);
     broadcastToRoom(room, { type: 'peer-left', id: ws.id }, null);
   });

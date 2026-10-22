@@ -621,7 +621,7 @@ function onControllerSelectStart(controller) {
 // mientras se trabaja con la otra. Reutiliza el mismo "agarrar y girar la
 // mano" que ya usan Rotar/Libre con la derecha (beginControllerRotate).
 function onLeftControllerSelectStart(controller) {
-  if (selectedMesh && !selectedMesh.userData.locked) {
+  if (selectedMesh && !isLocked(selectedMesh)) {
     beginControllerRotate(controller, { object: selectedMesh });
     pulseHaptic(controller, 0.4, 15);
   }
@@ -739,7 +739,7 @@ function updateTwoHandZoom(leftController, rightController) {
     return;
   }
 
-  if (!selectedMesh || selectedMesh.userData.locked) return;
+  if (!selectedMesh || isLocked(selectedMesh)) return;
 
   _pinchA.setFromMatrixPosition(leftController.matrixWorld);
   _pinchB.setFromMatrixPosition(rightController.matrixWorld);
@@ -1051,7 +1051,7 @@ function pickFrontFacingHits(hits, rayDirection) {
 // de bloquear también lo que está más allá.
 function pickActionableHit(hits, rayDirection) {
   const frontHits = pickFrontFacingHits(hits, rayDirection);
-  return frontHits.find((hit) => !hit.object.userData.locked) || null;
+  return frontHits.find((hit) => !isLocked(hit.object)) || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,7 +1128,7 @@ function applyToolAt(mesh, centerLocal, direction, deltaSeconds, faceIndex, fill
 }
 
 function beginControllerMove(controller, hit) {
-  if (!hit || hit.object.userData.locked) return;
+  if (!hit || isLocked(hit.object)) return;
 
   beginTransformSnapshot(hit.object);
   const controllerPos = new THREE.Vector3().setFromMatrixPosition(controller.matrixWorld);
@@ -1147,7 +1147,7 @@ function updateControllerMove(controller) {
 // lo mismo que el controlador desde que se empezó a sujetar - "agarrar y girar
 // la mano", igual que se manipularía un objeto real.
 function beginControllerRotate(controller, hit) {
-  if (!hit || hit.object.userData.locked) return;
+  if (!hit || isLocked(hit.object)) return;
 
   beginTransformSnapshot(hit.object);
   controller.userData.rotateMesh = hit.object;
@@ -1395,18 +1395,17 @@ function beginTransformSnapshot(mesh) {
     mesh,
     before: { position: mesh.position.clone(), quaternion: mesh.quaternion.clone(), scale: mesh.scale.clone() },
   };
+  lockNetworkPiece(mesh); // avisa a los demás "la estoy usando" (Fase 4, no-op si no es pieza de red)
 }
 
 function commitTransformSnapshot() {
   if (!activeTransformSnapshot) return;
   const { mesh, before } = activeTransformSnapshot;
-  pushUndo({
-    type: 'transform',
-    mesh,
-    before,
-    after: { position: mesh.position.clone(), quaternion: mesh.quaternion.clone(), scale: mesh.scale.clone() },
-  });
+  const after = { position: mesh.position.clone(), quaternion: mesh.quaternion.clone(), scale: mesh.scale.clone() };
+  pushUndo({ type: 'transform', mesh, before, after });
   activeTransformSnapshot = null;
+  sendPieceTransform(mesh, after);
+  unlockNetworkPiece(mesh);
 }
 
 function updateUndoButton() {
@@ -1430,15 +1429,30 @@ function setColor(hex) {
   updateVRMenuHighlight();
 }
 
+// Envuelto en begin/commit igual que los demás transforms - de regalo queda
+// deshacer-capaz (antes no lo era) y sincronizado en red (Fase 4), sin
+// lógica nueva: es un cambio instantáneo, el "arrastre" dura un solo tick.
 function scaleModel(factor) {
-  if (!selectedMesh || selectedMesh.userData.locked) return;
+  if (!selectedMesh || isLocked(selectedMesh)) return;
+  beginTransformSnapshot(selectedMesh);
   selectedMesh.scale.multiplyScalar(factor);
+  commitTransformSnapshot();
 }
 
+// Bloqueo MANUAL (el candado de la lista de piezas) - persistente hasta que
+// el usuario lo cambie a mano. Distinto del bloqueo automático de red
+// (userData.networkLockedBy, ver isLocked) que solo dura mientras OTRO
+// usuario está arrastrando/rotando/escalando esa pieza en este momento.
 function toggleLock(mesh) {
   mesh.userData.locked = !mesh.userData.locked;
   if (mesh === selectedMesh) syncTransformControls();
   refreshPieceList();
+}
+
+// Una pieza se considera bloqueada si el usuario la bloqueó a mano O si
+// alguien más la tiene agarrada ahora mismo en la red (ver Fase 4).
+function isLocked(mesh) {
+  return !!(mesh.userData.locked || mesh.userData.networkLockedBy);
 }
 
 // Adjunta/separa los tres gizmos de Unity según la herramienta activa, la
@@ -1454,7 +1468,7 @@ function syncTransformControls() {
   tcRotate.enabled = true;
   tcScale.enabled = true;
 
-  const canEdit = !!(selectedMesh && selectedMesh.visible && !selectedMesh.userData.locked);
+  const canEdit = !!(selectedMesh && selectedMesh.visible && !isLocked(selectedMesh));
   const slots = [
     { tc: tcMove, tool: 'move' },
     { tc: tcRotate, tool: 'rotate' },
@@ -1587,8 +1601,16 @@ function refreshPieceList() {
     const lockBtn = document.createElement('button');
     lockBtn.type = 'button';
     lockBtn.className = 'piece-row-icon-btn';
-    lockBtn.textContent = mesh.userData.locked ? '🔒' : '🔓';
-    lockBtn.title = mesh.userData.locked ? 'Desbloquear pieza' : 'Bloquear pieza';
+    if (mesh.userData.networkLockedBy) {
+      // Alguien más la está editando ahora mismo - no tiene sentido dejar
+      // tocar el candado MANUAL mientras tanto, sería confuso.
+      lockBtn.textContent = '🔒';
+      lockBtn.title = 'Otra persona la está editando ahora mismo';
+      lockBtn.disabled = true;
+    } else {
+      lockBtn.textContent = mesh.userData.locked ? '🔒' : '🔓';
+      lockBtn.title = mesh.userData.locked ? 'Desbloquear pieza' : 'Bloquear pieza';
+    }
     lockBtn.addEventListener('click', (event) => {
       event.stopPropagation();
       toggleLock(mesh);
@@ -1830,6 +1852,12 @@ function handleMultiplayerMessage(message) {
     if (finish) finish(true);
   } else if (message.type === 'piece-list') {
     for (const piece of message.pieces) addNetworkPiece(piece);
+  } else if (message.type === 'piece-transform') {
+    applyNetworkTransform(message);
+  } else if (message.type === 'piece-locked') {
+    setNetworkLock(message.pieceId, message.by);
+  } else if (message.type === 'piece-unlocked') {
+    setNetworkLock(message.pieceId, null);
   }
 }
 
@@ -1877,7 +1905,9 @@ function uploadPieceToServer(file) {
 
 // Crea en la escena una pieza que llegó del servidor (recién agregada por
 // alguien, o parte del historial de la sala al conectarse) - la posición la
-// decide el slot que asignó el servidor, nunca un cálculo local.
+// decide el slot que asignó el servidor, nunca un cálculo local. Si ya la
+// habían movido antes de que esta pestaña se conectara, se usa esa posición
+// guardada en vez del slot original (ver 'position' en el servidor).
 function addNetworkPiece(piece) {
   if (networkPieceMeshes.has(piece.id)) return; // ya existe (ej. piece-list repetido tras reconectar)
 
@@ -1890,10 +1920,61 @@ function addNetworkPiece(piece) {
   }
 
   const mesh = buildPieceMesh(geometry, piece.name);
-  mesh.position.copy(MODEL_POSITION).add(pieceSlotOffset(piece.slot));
+  if (piece.position) {
+    mesh.position.fromArray(piece.position);
+    mesh.quaternion.fromArray(piece.quaternion);
+    mesh.scale.fromArray(piece.scale);
+  } else {
+    mesh.position.copy(MODEL_POSITION).add(pieceSlotOffset(piece.slot));
+  }
   mesh.userData.networkId = piece.id;
+  mesh.userData.networkLockedBy = piece.lockedBy || null;
   networkPieceMeshes.set(piece.id, mesh);
   addMesh(mesh);
+}
+
+// Aplica el transform final que otra persona le dio a una pieza de red -
+// nunca se recibe de vuelta la propia (ver sendPieceTransform/el servidor).
+function applyNetworkTransform(message) {
+  const mesh = networkPieceMeshes.get(message.pieceId);
+  if (!mesh) return;
+  mesh.position.fromArray(message.position);
+  mesh.quaternion.fromArray(message.quaternion);
+  mesh.scale.fromArray(message.scale);
+  if (selectedMesh === mesh && selectionHelper) selectionHelper.update();
+}
+
+function setNetworkLock(pieceId, byPeerId) {
+  const mesh = networkPieceMeshes.get(pieceId);
+  if (!mesh) return;
+  mesh.userData.networkLockedBy = byPeerId;
+  if (selectedMesh === mesh) syncTransformControls(); // suelta el gizmo si alguien más acaba de tomarla
+  refreshPieceList();
+}
+
+// Las tres funciones de abajo son no-op silencioso si la pieza no es de red
+// (sin networkId, ej. el modelo por defecto) o si no hay conexión activa -
+// el bloqueo/transform en red es un AÑADIDO, nunca un requisito para poder
+// editar localmente.
+function lockNetworkPiece(mesh) {
+  if (!mesh.userData.networkId || !multiplayerSocket || multiplayerSocket.readyState !== WebSocket.OPEN) return;
+  multiplayerSocket.send(JSON.stringify({ type: 'lock-piece', pieceId: mesh.userData.networkId }));
+}
+
+function unlockNetworkPiece(mesh) {
+  if (!mesh.userData.networkId || !multiplayerSocket || multiplayerSocket.readyState !== WebSocket.OPEN) return;
+  multiplayerSocket.send(JSON.stringify({ type: 'unlock-piece', pieceId: mesh.userData.networkId }));
+}
+
+function sendPieceTransform(mesh, transform) {
+  if (!mesh.userData.networkId || !multiplayerSocket || multiplayerSocket.readyState !== WebSocket.OPEN) return;
+  multiplayerSocket.send(JSON.stringify({
+    type: 'transform',
+    pieceId: mesh.userData.networkId,
+    position: transform.position.toArray(),
+    quaternion: transform.quaternion.toArray(),
+    scale: transform.scale.toArray(),
+  }));
 }
 
 // atob/btoa trabajan con strings, no con bytes crudos - y pasar un
