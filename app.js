@@ -1119,11 +1119,14 @@ function applyToolAt(mesh, centerLocal, direction, deltaSeconds, faceIndex, fill
   if (currentTool === 'paint') {
     beginStrokeIfNeeded(mesh, 'color');
     paintVerticesNear(mesh, centerLocal, deltaSeconds);
+    sendBrushStroke(mesh, { tool: 'paint', centerLocal: centerLocal.toArray(), deltaSeconds, radius: BRUSH_RADIUS, color: currentColor.toArray() });
   } else if (currentTool === 'sculpt') {
     beginStrokeIfNeeded(mesh, 'position');
     displaceVerticesNear(mesh, centerLocal, direction, deltaSeconds);
+    sendBrushStroke(mesh, { tool: 'sculpt', centerLocal: centerLocal.toArray(), deltaSeconds, radius: BRUSH_RADIUS, direction });
   } else if (currentTool === 'smartpaint') {
-    applySmartPaint(mesh, faceIndex, filledFaces);
+    const paintedFaces = applySmartPaint(mesh, faceIndex, filledFaces);
+    if (paintedFaces) sendBrushStroke(mesh, { tool: 'smartpaint', faceIndex, angleThresholdRad: smartPaintAngleThresholdRad, color: currentColor.toArray() });
   }
 }
 
@@ -1161,7 +1164,12 @@ function updateControllerRotate(controller) {
   controller.userData.rotateMesh.quaternion.copy(_deltaQuat).multiply(controller.userData.rotateStartMeshQuat);
 }
 
-function displaceVerticesNear(mesh, centerLocal, direction, deltaSeconds) {
+// radius tiene un valor por defecto (BRUSH_RADIUS, el del propio cliente)
+// para que las llamadas locales existentes seas idénticas a antes; un trazo
+// recibido de la red pasa el radio de QUIEN lo esculpió explícitamente (ver
+// applyRemoteBrushStroke), que puede diferir del propio si cada quien tiene
+// el control «Precisión» en un valor distinto.
+function displaceVerticesNear(mesh, centerLocal, direction, deltaSeconds, radius = BRUSH_RADIUS) {
   const geometry = mesh.geometry;
   const position = geometry.attributes.position;
   const normal = geometry.attributes.normal;
@@ -1170,11 +1178,11 @@ function displaceVerticesNear(mesh, centerLocal, direction, deltaSeconds) {
   for (let i = 0; i < position.count; i++) {
     _vertex.fromBufferAttribute(position, i);
     const distance = _vertex.distanceTo(centerLocal);
-    if (distance >= BRUSH_RADIUS) continue;
+    if (distance >= radius) continue;
 
     // Caída suave (smoothstep) para que el pincel deforme de forma fluida,
     // en vez de un borde duro en el límite del radio de influencia.
-    const t = 1 - distance / BRUSH_RADIUS;
+    const t = 1 - distance / radius;
     const falloff = t * t * (3 - 2 * t);
 
     _normal.fromBufferAttribute(normal, i);
@@ -1187,26 +1195,29 @@ function displaceVerticesNear(mesh, centerLocal, direction, deltaSeconds) {
   geometry.computeBoundingSphere(); // mantiene el raycasting correcto tras deformar la malla
 }
 
-function paintVerticesNear(mesh, centerLocal, deltaSeconds) {
+// color/radius por defecto = los del propio cliente (pintura local); un
+// trazo remoto pasa ambos explícitamente (el color Y el radio de pincel son
+// ajustes propios de cada cliente, pueden diferir de los del receptor).
+function paintVerticesNear(mesh, centerLocal, deltaSeconds, color = currentColor, radius = BRUSH_RADIUS) {
   const geometry = mesh.geometry;
   const position = geometry.attributes.position;
-  const color = geometry.attributes.color;
+  const colorAttr = geometry.attributes.color;
   const mixAmount = Math.min(1, PAINT_STRENGTH * deltaSeconds);
 
   for (let i = 0; i < position.count; i++) {
     _vertex.fromBufferAttribute(position, i);
     const distance = _vertex.distanceTo(centerLocal);
-    if (distance >= BRUSH_RADIUS) continue;
+    if (distance >= radius) continue;
 
-    const t = 1 - distance / BRUSH_RADIUS;
+    const t = 1 - distance / radius;
     const falloff = t * t * (3 - 2 * t);
 
-    _color.fromBufferAttribute(color, i);
-    _color.lerp(currentColor, mixAmount * falloff);
-    color.setXYZ(i, _color.r, _color.g, _color.b);
+    _color.fromBufferAttribute(colorAttr, i);
+    _color.lerp(color, mixAmount * falloff);
+    colorAttr.setXYZ(i, _color.r, _color.g, _color.b);
   }
 
-  color.needsUpdate = true;
+  colorAttr.needsUpdate = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,14 +1339,17 @@ function paintFaces(mesh, faceIndices, color) {
 
 // filledFaces evita rehacer el flood-fill si el rayo sigue sobre una cara que
 // ya quedó pintada en este mismo trazo (p. ej. al mantener el gatillo/clic
-// quieto, o al arrastrar dentro de la misma región ya seleccionada).
+// quieto, o al arrastrar dentro de la misma región ya seleccionada). Devuelve
+// las caras recién pintadas (o null si no hizo nada) para que el llamador
+// sepa si de verdad hubo trabajo nuevo que anunciar a la red (Fase 5).
 function applySmartPaint(mesh, faceIndex, filledFaces) {
-  if (faceIndex == null || !filledFaces || filledFaces.has(faceIndex)) return;
+  if (faceIndex == null || !filledFaces || filledFaces.has(faceIndex)) return null;
 
   beginStrokeIfNeeded(mesh, 'color');
   const faces = floodFillSimilarFaces(mesh, faceIndex, smartPaintAngleThresholdRad);
   paintFaces(mesh, faces, currentColor);
   for (const f of faces) filledFaces.add(f);
+  return faces;
 }
 // ---------------------------------------------------------------------------
 function pushUndo(action) {
@@ -1387,6 +1401,7 @@ function commitStroke() {
   const { mesh, attribute, before } = activeStroke;
   pushUndo({ type: 'geometry', mesh, attribute, before, after: mesh.geometry.attributes[attribute].array.slice() });
   activeStroke = null;
+  sendGeometrySnapshot(mesh); // Fase 5: para que quien se una después vea el trazo ya aplicado, no-op si no es pieza de red
 }
 
 function beginTransformSnapshot(mesh) {
@@ -1844,6 +1859,8 @@ function handleMultiplayerMessage(message) {
     myPeerId = message.id;
   } else if (message.type === 'relay' && message.payload?.type === 'presence') {
     updatePeerPresence(message.from, message.payload);
+  } else if (message.type === 'relay' && message.payload?.type === 'brush-stroke') {
+    applyRemoteBrushStroke(message.payload);
   } else if (message.type === 'peer-left') {
     removePeerAvatar(message.id);
   } else if (message.type === 'piece-added') {
@@ -1929,6 +1946,7 @@ function addNetworkPiece(piece) {
   }
   mesh.userData.networkId = piece.id;
   mesh.userData.networkLockedBy = piece.lockedBy || null;
+  applyGeometryOverride(mesh, piece);
   networkPieceMeshes.set(piece.id, mesh);
   addMesh(mesh);
 }
@@ -1975,6 +1993,95 @@ function sendPieceTransform(mesh, transform) {
     quaternion: transform.quaternion.toArray(),
     scale: transform.scale.toArray(),
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Multijugador (Fase 5: esculpido/pintura compartidos)
+// ---------------------------------------------------------------------------
+// Reenviar los VÉRTICES movidos cuadro a cuadro sería carísimo (cientos de KB
+// por frame en una malla de decenas de miles de vértices). En vez de eso se
+// manda solo el PARÁMETRO del pincel (centro, radio, color/dirección) y cada
+// cliente recalcula el mismo desplazamiento con sus propias
+// displaceVerticesNear/paintVerticesNear (deterministas, ya probadas en modo
+// local) - 'tool'/'radius'/'color' van SIEMPRE explícitos en el mensaje (no
+// se asume que el receptor tenga el mismo pincel/herramienta/color
+// seleccionados en su propia interfaz en ese momento).
+function sendBrushStroke(mesh, stroke) {
+  if (!mesh.userData.networkId || !multiplayerSocket || multiplayerSocket.readyState !== WebSocket.OPEN) return;
+  multiplayerSocket.send(JSON.stringify({ type: 'brush-stroke', pieceId: mesh.userData.networkId, ...stroke }));
+}
+
+// Aplica el trazo de pincel de otra persona sobre SU copia de la pieza -
+// nunca se recibe de vuelta el propio (mismo patrón que piece-transform). No
+// pasa por beginStrokeIfNeeded/commitStroke: el deshacer es un concepto
+// local ("lo que YO hice"), no debe registrar ni poder revertir el trabajo
+// de alguien más (pregunta de diseño deliberadamente dejada abierta desde el
+// análisis inicial de multijugador - ver memoria del proyecto).
+function applyRemoteBrushStroke(stroke) {
+  const mesh = networkPieceMeshes.get(stroke.pieceId);
+  if (!mesh) return;
+
+  if (stroke.tool === 'sculpt') {
+    const center = new THREE.Vector3().fromArray(stroke.centerLocal);
+    displaceVerticesNear(mesh, center, stroke.direction, stroke.deltaSeconds, stroke.radius);
+  } else if (stroke.tool === 'paint') {
+    const center = new THREE.Vector3().fromArray(stroke.centerLocal);
+    const color = new THREE.Color().fromArray(stroke.color);
+    paintVerticesNear(mesh, center, stroke.deltaSeconds, color, stroke.radius);
+  } else if (stroke.tool === 'smartpaint') {
+    const faces = floodFillSimilarFaces(mesh, stroke.faceIndex, stroke.angleThresholdRad);
+    paintFaces(mesh, faces, new THREE.Color().fromArray(stroke.color));
+  }
+
+  if (selectedMesh === mesh && selectionHelper) selectionHelper.update();
+}
+
+// Al terminar un trazo (soltar el gatillo/clic), se manda una instantánea
+// completa de la geometría actual (posición + color de cada vértice) para
+// que el SERVIDOR la guarde - así alguien que se une DESPUÉS recibe la pieza
+// ya esculpida/pintada (vía piece-list), no la original en blanco. Los
+// strokes en vivo (arriba) ya mantienen al día a quien YA está conectado;
+// esto es solo para la persistencia de los que llegan tarde.
+function sendGeometrySnapshot(mesh) {
+  if (!mesh.userData.networkId || !multiplayerSocket || multiplayerSocket.readyState !== WebSocket.OPEN) return;
+  multiplayerSocket.send(JSON.stringify({
+    type: 'geometry-update',
+    pieceId: mesh.userData.networkId,
+    position: float32ArrayToBase64(mesh.geometry.attributes.position.array),
+    color: float32ArrayToBase64(mesh.geometry.attributes.color.array),
+  }));
+}
+
+// Aplica la última instantánea de geometría guardada en el servidor (si la
+// hay) sobre una pieza de red recién construida a partir del STL original -
+// el conteo/orden de vértices coincide siempre exactamente porque sale del
+// MISMO pipeline determinista (buildPieceMesh + mergeVertices) sobre los
+// MISMOS bytes originales, nunca de un STL distinto.
+function applyGeometryOverride(mesh, piece) {
+  if (!piece.positionOverride && !piece.colorOverride) return;
+  const geometry = mesh.geometry;
+  if (piece.positionOverride) {
+    geometry.attributes.position.array.set(base64ToFloat32Array(piece.positionOverride));
+    geometry.attributes.position.needsUpdate = true;
+  }
+  if (piece.colorOverride) {
+    geometry.attributes.color.array.set(base64ToFloat32Array(piece.colorOverride));
+    geometry.attributes.color.needsUpdate = true;
+  }
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+}
+
+// El .buffer de un BufferAttribute puede no empezar en el byte 0 ni abarcar
+// el ArrayBuffer entero (vista parcial) - slice() por byteOffset/byteLength
+// evita asumir que siempre es una vista "completa" y de paso reusa
+// arrayBufferToBase64 (ya resuelve el límite de argumentos de btoa).
+function float32ArrayToBase64(floatArray) {
+  return arrayBufferToBase64(floatArray.buffer.slice(floatArray.byteOffset, floatArray.byteOffset + floatArray.byteLength));
+}
+
+function base64ToFloat32Array(base64) {
+  return new Float32Array(base64ToArrayBuffer(base64));
 }
 
 // atob/btoa trabajan con strings, no con bytes crudos - y pasar un

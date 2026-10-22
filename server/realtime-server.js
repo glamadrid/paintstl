@@ -5,8 +5,13 @@
 // memoria para poder mandarla completa a quien se una después. Fase 4: el
 // servidor también recuerda la última posición/rotación/escala conocida de
 // cada pieza (para que un recén llegado la vea donde quedó, no en su slot
-// original) y quién la tiene bloqueada mientras la está editando. Todo lo
-// demás (ej. 'presence') sigue siendo un relay puro, sin interpretar.
+// original) y quién la tiene bloqueada mientras la está editando. Fase 5: el
+// esculpido/pintura en vivo (mensaje 'brush-stroke') sigue siendo un relay
+// puro igual que 'presence' - el servidor no necesita entender los vértices
+// para reenviarlos a los demás conectados ahora mismo. Lo único que SÍ
+// guarda es una instantánea de la geometría (posiciones+colores) cada vez
+// que alguien termina un trazo ('geometry-update'), para que quien se una
+// DESPUÉS reciba la pieza ya esculpida/pintada, no la original en blanco.
 'use strict';
 
 const { WebSocketServer } = require('ws');
@@ -78,6 +83,10 @@ wss.on('connection', (ws, req) => {
         quaternion: null,
         scale: null,
         lockedBy: null,
+        // null = todavía con la geometría original del archivo subido; se
+        // rellena con la última instantánea conocida (ver 'geometry-update').
+        positionOverride: null,
+        colorOverride: null,
       };
       room.pieces.set(piece.id, piece);
       // Se manda a TODOS, incluido quien la subió - nadie coloca la pieza
@@ -115,8 +124,20 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // Cualquier otro tipo de mensaje (ej. 'presence') sigue siendo relay
-    // puro, igual que en Fases 1-2.
+    if (message.type === 'geometry-update') {
+      const piece = room.pieces.get(message.pieceId);
+      if (!piece) return;
+      // Solo se GUARDA - quien ya está conectado ya tiene esto aplicado en
+      // vivo vía el relay de 'brush-stroke', esto es nada más para que un
+      // recién llegado reciba la pieza en su estado actual, no en blanco.
+      piece.positionOverride = message.position;
+      piece.colorOverride = message.color;
+      return;
+    }
+
+    // Cualquier otro tipo de mensaje (ej. 'presence', 'brush-stroke') sigue
+    // siendo relay puro, igual que en Fases 1-2 - el servidor no necesita
+    // entender un trazo de pincel para reenviarlo a los demás de la sala.
     broadcastToRoom(room, { type: 'relay', from: ws.id, payload: message }, ws);
   });
 
